@@ -1,0 +1,7 @@
+numpy
+sounddevice
+soundfile
+tensorflow
+tensorflow-hub
+librosa
+opencv-python
