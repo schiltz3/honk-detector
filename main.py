@@ -1,6 +1,4 @@
 import os
-os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'  # Suppress INFO and WARNING logs
-
 import sounddevice as sd
 import soundfile as sf
 import tensorflow as tf
@@ -23,10 +21,14 @@ VIDEO_FPS = 20
 VIDEO_BUFFER_SECONDS = 20
 VIDEO_WIDTH = 640
 VIDEO_HEIGHT = 480
-CONFIDENCE_THRESHOLD = 0.3
+DEBUG = True
+CONFIDENCE_THRESHOLD = 0.1  # Lower threshold for debug
 # ------------------------------------------------
 
-# Load YAMNet
+# Suppress TensorFlow warnings
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
+
+# Load YAMNet model and labels
 print("Loading YAMNet...")
 yamnet_model = hub.load("https://tfhub.dev/google/yamnet/1")
 class_map_path = tf.keras.utils.get_file(
@@ -36,68 +38,79 @@ class_map_path = tf.keras.utils.get_file(
 class_names = [line.strip().split(',')[2] for line in open(class_map_path).readlines()[1:]]
 print("YAMNet loaded.")
 
-# Audio buffer
+# Buffers and queues
 audio_queue = queue.Queue()
-audio_buffer = deque(maxlen=SAMPLE_RATE * AUDIO_BUFFER_SECONDS)
+audio_buffer = deque(maxlen=SAMPLE_RATE * AUDIO_BUFFER_SECONDS)  # stores raw audio blocks
+video_buffer = deque(maxlen=VIDEO_BUFFER_SECONDS * VIDEO_FPS)    # stores video frames
 
-# Video buffer
-video_buffer = deque(maxlen=VIDEO_BUFFER_SECONDS * VIDEO_FPS)
+# Event to signal threads to stop
+stop_event = threading.Event()
 
-# Audio callback
+# Audio callback function to enqueue recorded audio blocks
 def audio_callback(indata, frames, time_info, status):
     if status:
         print("Audio Status:", status)
     audio_queue.put(indata.copy())
 
-# Honk detection
+# Function to run YAMNet detection on audio chunk
 def detect_honk(audio_chunk):
     audio_chunk = audio_chunk.astype(np.float32)
     scores, _, _ = yamnet_model(audio_chunk)
     prediction = np.mean(scores.numpy(), axis=0)
     top_indices = np.argsort(prediction)[-5:][::-1]
-    print(f"Top class: {class_names[top_indices[0]]}, confidence: {prediction[top_indices[0]]:.3f}")
+
+    if DEBUG:
+        print("\n🔊 Top Predictions:")
+        for i in top_indices:
+            print(f"{class_names[i]}: {prediction[i]:.3f}")
 
     for i in top_indices:
         label = class_names[i].lower()
         conf = prediction[i]
-        print(f"Detected: {label} ({conf:.2f})")
         if "horn" in label and conf > CONFIDENCE_THRESHOLD:
             return True
     return False
 
-# Save audio buffer
+# Save audio buffer to WAV file
 def save_audio(buffer):
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    filename = f"honk_audio_{timestamp}.wav"
-    data = np.concatenate(buffer)
+    filename = f"debug_audio_{timestamp}.wav"
+    data = np.concatenate(buffer, axis=0)
     sf.write(filename, data, SAMPLE_RATE)
-    print(f"Audio saved: {filename}")
+    print(f"✅ Saved AUDIO: {filename}")
 
-# Save video buffer
+# Save video buffer to AVI file
 def save_video(frames):
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    filename = f"honk_video_{timestamp}.avi"
+    filename = f"debug_video_{timestamp}.avi"
     fourcc = cv2.VideoWriter_fourcc(*'XVID')
     out = cv2.VideoWriter(filename, fourcc, VIDEO_FPS, (VIDEO_WIDTH, VIDEO_HEIGHT))
     for frame in frames:
         out.write(frame)
     out.release()
-    print(f"Video saved: {filename}")
+    print(f"✅ Saved VIDEO: {filename}")
 
-# Audio processor
+# Thread function to process audio and detect honks
 def process_audio():
-    while True:
-        block = audio_queue.get()
-        audio_buffer.append(block)
-        if len(audio_buffer) >= SAMPLE_RATE:
-            last_second = np.concatenate(list(audio_buffer)[-SAMPLE_RATE:])
-            if detect_honk(last_second):
-                print("Honk detected!")
-                save_audio(list(audio_buffer))
-                save_video(list(video_buffer))
-                time.sleep(3)  # Avoid repeated triggers
+    while not stop_event.is_set():
+        try:
+            block = audio_queue.get(timeout=1)
+            audio_buffer.append(block)
+            # Check if we have at least 1 second of audio for detection
+            if len(audio_buffer) * AUDIO_BLOCK_SIZE >= SAMPLE_RATE:
+                # Concatenate the last second of audio for detection
+                last_second = np.concatenate(list(audio_buffer)[-int(SAMPLE_RATE / AUDIO_BLOCK_SIZE):], axis=0).flatten()
+                if detect_honk(last_second):
+                    print("🚗 Car horn detected!")
+                    save_audio(list(audio_buffer))
+                    save_video(list(video_buffer))
+                    # Pause briefly to avoid multiple saves on same event
+                    time.sleep(2)
+        except queue.Empty:
+            continue
+    print("🎧 Audio processing stopped.")
 
-# Video capture thread
+# Thread function to capture video frames continuously
 def record_video():
     cap = cv2.VideoCapture(0)
     cap.set(cv2.CAP_PROP_FRAME_WIDTH, VIDEO_WIDTH)
@@ -105,40 +118,50 @@ def record_video():
     cap.set(cv2.CAP_PROP_FPS, VIDEO_FPS)
 
     if not cap.isOpened():
-        print("Error: Could not open webcam.")
+        print("❌ Webcam not available.")
+        stop_event.set()
         return
 
-    print("Recording video...")
-    while True:
+    print("📷 Capturing video...")
+    while not stop_event.is_set():
         ret, frame = cap.read()
         if ret:
             video_buffer.append(frame)
         else:
-            print("Warning: Frame capture failed.")
+            print("⚠️ Frame drop.")
         time.sleep(1.0 / VIDEO_FPS)
 
-# Start everything
-def main():
-    print("Starting honk detection system...")
-    stream = sd.InputStream(samplerate=SAMPLE_RATE,
-                            channels=CHANNELS,
-                            blocksize=AUDIO_BLOCK_SIZE,
-                            callback=audio_callback)
+    cap.release()
+    print("📷 Video capture stopped.")
 
-    with stream:
-        audio_thread = threading.Thread(target=process_audio, daemon=True)
-        video_thread = threading.Thread(target=record_video, daemon=True)
-        audio_thread.start()
-        video_thread.start()
-        print("System is running. Press Ctrl+C to stop.")
-        try:
-            while True:
+# Main function to start audio stream and threads
+def main():
+    print("🔍 Honk Detector with Debug Mode ON")
+    stream = sd.InputStream(
+        samplerate=SAMPLE_RATE,
+        channels=CHANNELS,
+        blocksize=AUDIO_BLOCK_SIZE,
+        callback=audio_callback
+    )
+
+    try:
+        with stream:
+            audio_thread = threading.Thread(target=process_audio)
+            video_thread = threading.Thread(target=record_video)
+            audio_thread.start()
+            video_thread.start()
+
+            print("🎧 Listening... Press Ctrl+C to stop.")
+            while not stop_event.is_set():
                 time.sleep(1)
-        except KeyboardInterrupt:
-            print("Shutting down...")
-            audio_thread.join()
-            video_thread.join()
-            exit()
+    except KeyboardInterrupt:
+        print("\n🛑 Ctrl+C detected. Stopping...")
+        stop_event.set()
+
+    print("🔄 Waiting for threads to finish...")
+    audio_thread.join()
+    video_thread.join()
+    print("✅ Shutdown complete.")
 
 if __name__ == "__main__":
     main()
