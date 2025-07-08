@@ -35,10 +35,13 @@ CONFIDENCE_THRESHOLD = 0.08
 # Cooldown time between detections (seconds)
 COOLDOWN_SECONDS = 5
 
+# Output directory
+OUTPUT_DIR = "honk_clips"
+
 # ======================== BUFFERS & FLAGS ========================
 
 audio_queue = queue.Queue()
-audio_buffer = deque(maxlen=(AUDIO_BUFFER_SECONDS+POST_EVENT_SECONDS) * SAMPLE_RATE // AUDIO_BLOCK_SIZE)
+audio_buffer = deque(maxlen=(AUDIO_BUFFER_SECONDS + POST_EVENT_SECONDS) * SAMPLE_RATE // AUDIO_BLOCK_SIZE)
 video_buffer = deque(maxlen=VIDEO_FPS * (VIDEO_BUFFER_SECONDS + POST_EVENT_SECONDS))
 
 stop_event = threading.Event()
@@ -58,10 +61,8 @@ class_map_path = yamnet_model.class_map_path().numpy().decode('utf-8')
 class_names = [line.strip() for line in tf.io.gfile.GFile(class_map_path)]
 
 def detect_honk(audio_data):
-    # Horn-related keywords to check against
     horn_keywords = ["car horn", "vehicle horn", "truck horn", "air horn", "horn", "honking", "toot"]
 
-    # Resample and preprocess
     waveform = tf.convert_to_tensor(audio_data, dtype=tf.float32)
     scores, embeddings, spectrogram = yamnet_model(waveform)
 
@@ -75,20 +76,17 @@ def detect_honk(audio_data):
         score = mean_scores[i].numpy()
 
         if any(keyword in label.lower() for keyword in horn_keywords):
-            print(f"\033[92m- {label}: {score:.3f}\033[0m")  # green
+            print(f"\033[92m- {label}: {score:.3f}\033[0m")
         else:
             print(f"- {label}: {score:.3f}")
 
-    # Detection logic
     for i in top_indices:
         label_raw = class_names[i.numpy()]
         label = label_raw.split(',')[-1].strip().lower()
         score = mean_scores[i].numpy()
-
         if any(keyword in label for keyword in horn_keywords) and score > CONFIDENCE_THRESHOLD:
             return True
     return False
-
 
 # ======================== SAVE AUDIO + VIDEO ========================
 
@@ -97,10 +95,12 @@ def save_audio_video(audio_buf, video_buf):
         print("⚠️ Skipping save: empty audio or video buffer.")
         return
 
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    wav_file = f"temp_audio_{timestamp}.wav"
-    raw_video_file = f"temp_video_{timestamp}.avi"
-    output_file = f"honk_clip_{timestamp}.mp4"
+
+    wav_file = os.path.join(OUTPUT_DIR, f"temp_audio_{timestamp}.wav")
+    raw_video_file = os.path.join(OUTPUT_DIR, f"temp_video_{timestamp}.avi")
+    output_file = os.path.join(OUTPUT_DIR, f"honk_clip_{timestamp}.mp4")
 
     # Save audio
     audio_data = np.concatenate(audio_buf, axis=0)
@@ -116,7 +116,7 @@ def save_audio_video(audio_buf, video_buf):
     out.release()
     print(f"✅ Saved VIDEO: {raw_video_file}")
 
-    # Combine with FFmpeg (H.264 + AAC)
+    # Combine with FFmpeg
     ffmpeg_cmd = [
         'ffmpeg', '-y',
         '-i', raw_video_file,
@@ -134,6 +134,7 @@ def save_audio_video(audio_buf, video_buf):
     except subprocess.CalledProcessError:
         print("❌ FFmpeg failed to combine audio and video.")
 
+    # Optional cleanup
     # os.remove(wav_file)
     # os.remove(raw_video_file)
 
@@ -158,6 +159,7 @@ def record_video():
 
 def process_audio():
     last_detection_time = 0
+    recording_in_progress = False
 
     while not stop_event.is_set():
         try:
@@ -168,27 +170,45 @@ def process_audio():
                 recent_chunk = np.concatenate(list(audio_buffer)[-SAMPLE_RATE:], axis=0).flatten()
                 now = time.time()
 
-                if now - last_detection_time > COOLDOWN_SECONDS:
+                # Skip if still in cooldown or already saving
+                if (now - last_detection_time > COOLDOWN_SECONDS) and not recording_in_progress:
                     if detect_honk(recent_chunk):
                         print("🚗 Car horn detected!")
-                        last_detection_time = now
+                        recording_in_progress = True
 
+                        # Collect audio and video during post-event period
                         post_end = time.time() + POST_EVENT_SECONDS
                         while time.time() < post_end and not stop_event.is_set():
+                            try:
+                                post_block = audio_queue.get(timeout=0.1)
+                                audio_buffer.append(post_block)
+                            except queue.Empty:
+                                pass
+
+                            if video_buffer:
+                                video_buffer.append(video_buffer[-1])  # repeat last frame if needed
                             time.sleep(1.0 / VIDEO_FPS)
 
-                        # Merge buffers
-                        full_audio = list(audio_buffer)
-                        full_video = list(video_buffer)
+
+                        # Copy current buffers
+                        full_audio = list(audio_buffer).copy()
+                        full_video = list(video_buffer).copy()
 
                         save_audio_video(full_audio, full_video)
 
+                        # Clear for next event
                         audio_buffer.clear()
                         video_buffer.clear()
+
+                        # Only now start cooldown
+                        last_detection_time = time.time()
+                        recording_in_progress = False
+
         except queue.Empty:
             continue
 
     print("🎧 Audio processing stopped.")
+
 
 # ======================== CLEAN EXIT ========================
 
