@@ -38,8 +38,8 @@ COOLDOWN_SECONDS = 5
 # ======================== BUFFERS & FLAGS ========================
 
 audio_queue = queue.Queue()
-audio_buffer = deque(maxlen=AUDIO_BUFFER_SECONDS * SAMPLE_RATE // AUDIO_BLOCK_SIZE)
-video_buffer = deque(maxlen=VIDEO_FPS * VIDEO_BUFFER_SECONDS)
+audio_buffer = deque(maxlen=(AUDIO_BUFFER_SECONDS+POST_EVENT_SECONDS) * SAMPLE_RATE // AUDIO_BLOCK_SIZE)
+video_buffer = deque(maxlen=VIDEO_FPS * (VIDEO_BUFFER_SECONDS + POST_EVENT_SECONDS))
 
 stop_event = threading.Event()
 
@@ -58,6 +58,9 @@ class_map_path = yamnet_model.class_map_path().numpy().decode('utf-8')
 class_names = [line.strip() for line in tf.io.gfile.GFile(class_map_path)]
 
 def detect_honk(audio_data):
+    # Horn-related keywords to check against
+    horn_keywords = ["car horn", "vehicle horn", "truck horn", "air horn", "horn", "honking", "toot"]
+
     # Resample and preprocess
     waveform = tf.convert_to_tensor(audio_data, dtype=tf.float32)
     scores, embeddings, spectrogram = yamnet_model(waveform)
@@ -67,15 +70,25 @@ def detect_honk(audio_data):
 
     print("\n🔊 Top Predictions:")
     for i in top_indices:
-        label = class_names[i.numpy()]
+        label_raw = class_names[i.numpy()]
+        label = label_raw.split(',')[-1].strip()
         score = mean_scores[i].numpy()
-        print(f"{label}: {score:.3f}")
 
-    # Check if any "vehicle horn" class meets threshold
+        if any(keyword in label.lower() for keyword in horn_keywords):
+            print(f"\033[92m- {label}: {score:.3f}\033[0m")  # green
+        else:
+            print(f"- {label}: {score:.3f}")
+
+    # Detection logic
     for i in top_indices:
-        if "horn" in class_names[i.numpy()].lower() and mean_scores[i].numpy() > CONFIDENCE_THRESHOLD:
+        label_raw = class_names[i.numpy()]
+        label = label_raw.split(',')[-1].strip().lower()
+        score = mean_scores[i].numpy()
+
+        if any(keyword in label for keyword in horn_keywords) and score > CONFIDENCE_THRESHOLD:
             return True
     return False
+
 
 # ======================== SAVE AUDIO + VIDEO ========================
 
@@ -121,8 +134,8 @@ def save_audio_video(audio_buf, video_buf):
     except subprocess.CalledProcessError:
         print("❌ FFmpeg failed to combine audio and video.")
 
-    os.remove(wav_file)
-    os.remove(raw_video_file)
+    # os.remove(wav_file)
+    # os.remove(raw_video_file)
 
 # ======================== VIDEO RECORDING ========================
 
@@ -160,30 +173,13 @@ def process_audio():
                         print("🚗 Car horn detected!")
                         last_detection_time = now
 
-                        # 7s before detection
-                        pre_audio = list(audio_buffer)
-                        pre_video = list(video_buffer)
-
-                        # 7s after detection
-                        post_audio = []
-                        post_video = []
-
                         post_end = time.time() + POST_EVENT_SECONDS
-
                         while time.time() < post_end and not stop_event.is_set():
-                            try:
-                                post_block = audio_queue.get(timeout=0.1)
-                                post_audio.append(post_block)
-                            except queue.Empty:
-                                pass
-
-                            if video_buffer:
-                                post_video.append(video_buffer[-1])
                             time.sleep(1.0 / VIDEO_FPS)
 
                         # Merge buffers
-                        full_audio = pre_audio + post_audio
-                        full_video = pre_video + post_video
+                        full_audio = list(audio_buffer)
+                        full_video = list(video_buffer)
 
                         save_audio_video(full_audio, full_video)
 
