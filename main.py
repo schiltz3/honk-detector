@@ -1,4 +1,5 @@
 import os
+import subprocess
 import sounddevice as sd
 import soundfile as sf
 import tensorflow as tf
@@ -21,7 +22,7 @@ VIDEO_BUFFER_SECONDS = 10      # Keep 10 seconds of video before honk
 VIDEO_WIDTH = 640              # Webcam frame width
 VIDEO_HEIGHT = 480             # Webcam frame height
 DEBUG = True                   # Enable debug mode for predictions
-CONFIDENCE_THRESHOLD = 0.1     # Confidence to detect "horn"
+CONFIDENCE_THRESHOLD = 0.08     # Confidence to detect "horn"
 COOLDOWN_SECONDS = 5           # Prevent multiple triggers in short time
 # ------------------------------------------------------
 
@@ -71,6 +72,50 @@ def detect_honk(audio_chunk):
             return True
     return False
 
+def save_audio_video(audio_buffer, video_buffer):
+    if not video_buffer or not audio_buffer:
+        print("⚠️ Skipping save: audio or video buffer is empty.")
+        return
+
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    wav_file = f"temp_audio_{timestamp}.wav"
+    avi_file = f"temp_video_{timestamp}.avi"
+    output_file = f"honk_clip_{timestamp}.mp4"
+
+    # Save audio
+    audio_data = np.concatenate(audio_buffer, axis=0)
+    sf.write(wav_file, audio_data, SAMPLE_RATE)
+    print(f"✅ Saved AUDIO: {wav_file}")
+
+    # Save video
+    height, width = video_buffer[0].shape[:2]
+    fourcc = cv2.VideoWriter_fourcc(*'MJPG')
+    out = cv2.VideoWriter(avi_file, fourcc, VIDEO_FPS, (width, height))
+    for frame in video_buffer:
+        out.write(frame)
+    out.release()
+    print(f"✅ Saved VIDEO: {avi_file}")
+
+    # Combine using FFmpeg
+    ffmpeg_cmd = [
+        'ffmpeg',
+        '-y',  # Overwrite if exists
+        '-i', avi_file,
+        '-i', wav_file,
+        '-c:v', 'copy',
+        '-c:a', 'aac',
+        '-strict', 'experimental',
+        output_file
+    ]
+    try:
+        subprocess.run(ffmpeg_cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        print(f"🎬 Combined AUDIO + VIDEO saved as: {output_file}")
+    except subprocess.CalledProcessError:
+        print("❌ FFmpeg failed to combine audio and video.")
+
+    # Optional: clean up temp files
+    os.remove(wav_file)
+    os.remove(avi_file)
 # Save buffered audio to WAV file
 def save_audio(buffer):
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -81,14 +126,27 @@ def save_audio(buffer):
 
 # Save buffered video to AVI file
 def save_video(frames):
+    if not frames:
+        print("⚠️ No video frames to save.")
+        return
+
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     filename = f"debug_video_{timestamp}.avi"
-    fourcc = cv2.VideoWriter_fourcc(*'XVID')
-    out = cv2.VideoWriter(filename, fourcc, VIDEO_FPS, (VIDEO_WIDTH, VIDEO_HEIGHT))
+    height, width = frames[0].shape[:2]
+
+    # Use MJPG for wider compatibility
+    fourcc = cv2.VideoWriter_fourcc(*'MJPG')
+    out = cv2.VideoWriter(filename, fourcc, VIDEO_FPS, (width, height))
+
     for frame in frames:
+        if frame.shape[:2] != (height, width):
+            print("⚠️ Frame shape mismatch. Skipping.")
+            continue
         out.write(frame)
+
     out.release()
     print(f"✅ Saved VIDEO: {filename}")
+
 
 # Thread to process audio and trigger detection
 def process_audio():
@@ -113,6 +171,7 @@ def process_audio():
                         # Save pre-event buffers
                         save_audio(list(audio_buffer))
                         save_video(list(video_buffer))
+                        # save_audio_video(list(audio_buffer), list(video_buffer))
 
                         # Clear buffers to avoid repeated detections
                         audio_buffer.clear()
