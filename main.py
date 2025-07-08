@@ -104,17 +104,18 @@ def save_audio_video(audio_buf, video_buf):
 
     # Save audio
     audio_data = np.concatenate(audio_buf, axis=0)
+
+    # Trim audio to match video duration
+    expected_audio_samples = len(video_buf) * SAMPLE_RATE // VIDEO_FPS
+    if len(audio_data) > expected_audio_samples:
+        audio_data = audio_data[-expected_audio_samples:]
+    elif len(audio_data) < expected_audio_samples:
+        pad = expected_audio_samples - len(audio_data)
+        audio_data = np.pad(audio_data, (0, pad))
+
     sf.write(wav_file, audio_data, SAMPLE_RATE)
     print(f"✅ Saved AUDIO: {wav_file}")
 
-    # Save raw video
-    height, width = video_buf[0].shape[:2]
-    fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-    out = cv2.VideoWriter(raw_video_file, fourcc, VIDEO_FPS, (width, height))
-    for frame in video_buf:
-        out.write(frame)
-    out.release()
-    print(f"✅ Saved VIDEO: {raw_video_file}")
 
     # Combine with FFmpeg
     ffmpeg_cmd = [
