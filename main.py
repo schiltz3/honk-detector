@@ -26,7 +26,8 @@ VIDEO_HEIGHT = 480
 VIDEO_FPS = 20
 VIDEO_BUFFER_SECONDS = 7
 
-CONFIDENCE_THRESHOLD = 0.08
+# CONFIDENCE_THRESHOLD = 0.05
+CONFIDENCE_THRESHOLD = 0.04
 COOLDOWN_SECONDS = 5
 
 OUTPUT_DIR = "honk_clips"
@@ -62,20 +63,30 @@ def detect_honk(audio_data):
     mean_scores = tf.reduce_mean(scores, axis=0)
     top_indices = tf.argsort(mean_scores, direction='DESCENDING')[:5]
 
-    print("\n🔊 Top Predictions:")
+    # print("\n🔊 Top Predictions:")
     for i in top_indices:
         label_raw = class_names[i.numpy()]
         label = label_raw.split(',')[-1].strip()
         score = mean_scores[i].numpy()
-        if any(keyword in label.lower() for keyword in horn_keywords):
-            print(f"\033[92m- {label}: {score:.3f}\033[0m")
-        else:
-            print(f"- {label}: {score:.3f}")
+        # if any(keyword in label.lower() for keyword in horn_keywords):
+        #     print(f"\033[92m- {label}: {score:.3f}\033[0m")
+        # else:
+        #     print(f"- {label}: {score:.3f}")
 
     for i in top_indices:
         label = class_names[i.numpy()].split(',')[-1].strip().lower()
         score = mean_scores[i].numpy()
         if any(keyword in label for keyword in horn_keywords) and score > CONFIDENCE_THRESHOLD:
+            # Specifically exclude train horns (Trucks get classified as train horns)
+            # This would also let french horn slip through, but that's ok
+            if label == "train horn":
+                return False
+            # print out all top indicies that lead to a positive match
+            for i in top_indices:
+                if any(keyword in label.lower() for keyword in horn_keywords):
+                    print(f"\033[92m- {label}: {score:.3f}\033[0m")
+                else:
+                    print(f"- {label}: {score:.3f}")
             return True
     return False
 
@@ -93,26 +104,31 @@ def save_audio_video(audio_buf, video_buf):
     raw_video_file = os.path.join(OUTPUT_DIR, f"temp_video_{timestamp}.avi")
     output_file = os.path.join(OUTPUT_DIR, f"honk_clip_{timestamp}.mp4")
 
-    audio_data = np.concatenate(audio_buf, axis=0)
-    sf.write(wav_file, audio_data, SAMPLE_RATE)
-    print(f"✅ Saved AUDIO: {wav_file}")
+    # Convert to mono and save audio
+    audio_data = np.concatenate(audio_buf, axis=0).astype(np.float32)
+    sf.write(wav_file, audio_data, SAMPLE_RATE, format='WAV', subtype='PCM_16')
+    # print(f"✅ Saved AUDIO: {wav_file}")
 
+    # Save raw video
     height, width = video_buf[0].shape[:2]
     fourcc = cv2.VideoWriter_fourcc(*'mp4v')
     out = cv2.VideoWriter(raw_video_file, fourcc, VIDEO_FPS, (width, height))
     for frame in video_buf:
         out.write(frame)
     out.release()
-    print(f"✅ Saved VIDEO: {raw_video_file}")
+    # print(f"✅ Saved VIDEO: {raw_video_file}")
 
+    # Combine audio and video with compression
     ffmpeg_cmd = [
         'ffmpeg', '-y',
         '-i', raw_video_file,
         '-i', wav_file,
         '-c:v', 'libx264',
-        '-preset', 'fast',
-        '-crf', '23',
+        '-preset', 'veryslow',
+        '-crf', '28',
         '-c:a', 'aac',
+        '-b:a', '128k',
+        '-ac', '1',  # 👈 force mono audio in final output
         '-shortest',
         output_file
     ]
@@ -121,6 +137,15 @@ def save_audio_video(audio_buf, video_buf):
         print(f"🎬 Combined AUDIO + VIDEO saved as: {output_file}")
     except subprocess.CalledProcessError:
         print("❌ FFmpeg failed to combine audio and video.")
+
+    # ✅ Clean up temp files
+    try:
+        os.remove(wav_file)
+        os.remove(raw_video_file)
+        print("🧹 Temp files deleted.")
+    except Exception as e:
+        print(f"⚠️ Failed to delete temp files: {e}")
+
 
 # ======================== VIDEO RECORDING ========================
 
@@ -214,6 +239,7 @@ if __name__ == "__main__":
     print("📡 Starting honk detection...")
     threading.Thread(target=record_video, daemon=True).start()
 
+    print("Started honk detection")
     with sd.InputStream(channels=1, samplerate=SAMPLE_RATE, blocksize=AUDIO_BLOCK_SIZE, callback=audio_callback):
         process_audio()
 
